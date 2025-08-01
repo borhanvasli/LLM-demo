@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
-
+import torch.nn.functional as F
 import numpy as np
 import random
 from transformers import GPT2LMHeadModel, GPT2Tokenizer
@@ -15,7 +15,7 @@ random.seed(42)
 
 class RLHFTrainer:
     """
-    Simplified RLHF implementation for educational purposes.
+    RLHF implementation with Value Function for variance reduction.
     In practice, you'd use more sophisticated implementations like trlX or DeepSpeed-Chat.
     """
     
@@ -29,6 +29,9 @@ class RLHFTrainer:
         
         # Stage 2: Reward model
         self.reward_model = RewardModel(self.policy_model.config.hidden_size)
+        
+        # NEW: Value function for advantage estimation
+        self.value_function = ValueFunction(self.policy_model.config.hidden_size)
         
         # Freeze reference model
         for param in self.reference_model.parameters():
@@ -112,46 +115,179 @@ class RLHFTrainer:
             print(f"Epoch {epoch+1}/{epochs}, Loss: {total_loss/len(preference_data):.4f}, "
                   f"Accuracy: {accuracy:.4f}")
     
-    def stage3_ppo_training(self, prompts: List[str], epochs=3, lr=1e-5, 
-                           kl_coeff=0.1, clip_epsilon=0.2):
+    def stage3_ppo_with_value_function(self, prompts: List[str], epochs=3, lr=1e-5, 
+                                      kl_coeff=0.1, value_lr=5e-4, gamma=0.99):
         """
-        Stage 3: PPO training using reward model
-        This is a simplified version - real PPO is more complex
+        Stage 3: PPO training with Value Function for advantage estimation
+        This is much more stable than the previous simple policy gradient approach
         """
-        print("\nStage 3: PPO Training...")
+        print("\nStage 3: PPO Training with Value Function...")
         
-        optimizer = optim.AdamW(self.policy_model.parameters(), lr=lr)
+        policy_optimizer = optim.AdamW(self.policy_model.parameters(), lr=lr)
+        value_optimizer = optim.AdamW(self.value_function.parameters(), lr=value_lr)
         
         for epoch in range(epochs):
             total_reward = 0
-            total_kl = 0
+            total_advantage = 0
+            total_value_loss = 0
             
             for prompt in prompts:
-                # Generate response with current policy
-                response = self._generate_response(prompt)
+                # === EXPERIENCE COLLECTION ===
+                # Generate response and collect trajectory data
+                trajectory = self._collect_trajectory(prompt)
                 
-                # Calculate reward
-                embedding = self._get_response_embedding(prompt + response)
-                reward = self.reward_model(embedding.unsqueeze(0))
+                states = trajectory['states']
+                actions = trajectory['actions'] 
+                rewards = trajectory['rewards']
+                log_probs = trajectory['log_probs']
                 
-                # Calculate KL divergence penalty
-                kl_penalty = self._calculate_kl_penalty(prompt + response)
+                # === VALUE FUNCTION PREDICTIONS ===
+                # Get value estimates for all states in trajectory
+                state_embeddings = torch.stack([self._get_response_embedding(state) for state in states])
+                values = self.value_function(state_embeddings).squeeze(-1)
                 
-                # Total objective (reward - KL penalty)
-                objective = reward - kl_coeff * kl_penalty
+                # === ADVANTAGE COMPUTATION ===
+                # This is the KEY improvement over simple policy gradient
+                advantages, returns = self._compute_advantages_and_returns(
+                    rewards, values, gamma=gamma
+                )
                 
-                # Simple policy gradient update (simplified PPO)
-                loss = -objective
+                # === POLICY UPDATE (Actor) ===
+                # Normalize advantages for stability
+                normalized_advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
                 
-                optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                # Policy gradient with advantage weighting
+                policy_loss = -(torch.tensor(log_probs) * normalized_advantages).mean()
                 
-                total_reward += reward.item()
-                total_kl += kl_penalty.item()
+                # Add KL penalty
+                kl_penalty = self._calculate_kl_penalty_batch(states)
+                total_policy_loss = policy_loss + kl_coeff * kl_penalty
+                
+                # Update policy
+                policy_optimizer.zero_grad()
+                total_policy_loss.backward()
+                policy_optimizer.step()
+                
+                # === VALUE FUNCTION UPDATE (Critic) ===
+                # Train value function to predict returns accurately
+                value_loss = F.mse_loss(values, returns)
+                
+                value_optimizer.zero_grad()
+                value_loss.backward()
+                value_optimizer.step()
+                
+                # === LOGGING ===
+                total_reward += sum(rewards)
+                total_advantage += advantages.mean().item()
+                total_value_loss += value_loss.item()
             
-            print(f"Epoch {epoch+1}/{epochs}, Avg Reward: {total_reward/len(prompts):.4f}, "
-                  f"Avg KL: {total_kl/len(prompts):.4f}")
+            print(f"Epoch {epoch+1}/{epochs}")
+            print(f"  Avg Reward: {total_reward/len(prompts):.4f}")
+            print(f"  Avg Advantage: {total_advantage/len(prompts):.4f}")
+            print(f"  Value Loss: {total_value_loss/len(prompts):.4f}")
+    
+    def _collect_trajectory(self, prompt: str, max_tokens=50):
+        """
+        Generate a complete trajectory (sequence of states, actions, rewards)
+        This is essential for proper advantage computation
+        """
+        states = [prompt]  # Start with prompt
+        actions = []
+        rewards = []
+        log_probs = []
+        
+        current_text = prompt
+        
+        for step in range(max_tokens):
+            # Get next token distribution
+            inputs = self.tokenizer(current_text, return_tensors="pt", truncation=True, max_length=512)
+            
+            with torch.no_grad():
+                outputs = self.policy_model(**inputs)
+                logits = outputs.logits[0, -1, :]  # Last token logits
+                
+                # Sample action (next token)
+                probs = F.softmax(logits, dim=-1)
+                action = torch.multinomial(probs, 1).item()
+                log_prob = torch.log(probs[action]).item()
+                
+                # Decode action to text
+                action_text = self.tokenizer.decode([action])
+                current_text += action_text
+                
+                # Store trajectory data
+                states.append(current_text)
+                actions.append(action)
+                log_probs.append(log_prob)
+                
+                # Compute reward for this step (sparse reward at end, 0 elsewhere)
+                if step == max_tokens - 1 or action == self.tokenizer.eos_token_id:
+                    # Final reward from reward model
+                    embedding = self._get_response_embedding(current_text)
+                    final_reward = self.reward_model(embedding.unsqueeze(0)).item()
+                    rewards.append(final_reward)
+                    break
+                else:
+                    rewards.append(0.0)  # No intermediate rewards
+        
+        return {
+            'states': states[:-1],  # Remove last state (no action taken)
+            'actions': actions,
+            'rewards': rewards,
+            'log_probs': log_probs
+        }
+    
+    def _compute_advantages_and_returns(self, rewards, values, gamma=0.99):
+        """
+        Compute advantages and returns using the Value Function
+        
+        This is the CORE benefit of having a value function:
+        - Advantage = How much better/worse was this action than expected?
+        - Return = Discounted future rewards (what we're trying to predict)
+        
+        Args:
+            rewards: List of rewards at each step
+            values: Tensor of value function predictions
+            gamma: Discount factor
+            
+        Returns:
+            advantages: How much better/worse each action was than expected
+            returns: Discounted cumulative rewards (targets for value function)
+        """
+        rewards = torch.tensor(rewards, dtype=torch.float32)
+        T = len(rewards)
+        
+        # === COMPUTE RETURNS (Discounted Future Rewards) ===
+        returns = torch.zeros_like(rewards)
+        running_return = 0
+        
+        # Work backwards from the end
+        for t in reversed(range(T)):
+            running_return = rewards[t] + gamma * running_return
+            returns[t] = running_return
+        
+        # === COMPUTE ADVANTAGES ===
+        # Advantage = Actual Return - Expected Return (Value Function)
+        # This tells us: "Was this action better or worse than we expected?"
+        
+        if len(values) > len(returns):
+            values = values[:len(returns)]  # Trim if necessary
+        elif len(values) < len(returns):
+            # Pad with zeros if value function didn't predict all states
+            padding = torch.zeros(len(returns) - len(values))
+            values = torch.cat([values, padding])
+        
+        advantages = returns - values.detach()  # Detach to avoid training policy on value gradients
+        
+        return advantages, returns
+    
+    def _calculate_kl_penalty_batch(self, states):
+        """Calculate KL penalty for a batch of states"""
+        total_kl = 0
+        for state in states:
+            kl = self._calculate_kl_penalty(state)
+            total_kl += kl
+        return total_kl / len(states)
     
     def _get_response_embedding(self, text: str):
         """Get embedding representation of text"""
@@ -194,6 +330,40 @@ class RLHFTrainer:
         
         kl_div = torch.sum(torch.exp(ref_logprobs) * (ref_logprobs - policy_logprobs))
         return kl_div
+
+class ValueFunction(nn.Module):
+    """
+    Value Function Network - Predicts expected future rewards
+    
+    GOAL: Learn V(s) = E[sum of future rewards | starting from state s]
+    
+    Why do we need this?
+    1. Reduces variance in policy gradients (makes training more stable)
+    2. Provides baseline for advantage computation  
+    3. Helps the policy focus on truly good/bad actions
+    """
+    
+    def __init__(self, embedding_dim):
+        super().__init__()
+        self.layers = nn.Sequential(
+            nn.Linear(embedding_dim, 512),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(512, 256), 
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 1)  # Single scalar output (expected return)
+        )
+    
+    def forward(self, state_embedding):
+        """
+        Args:
+            state_embedding: Vector representation of current state
+            
+        Returns:
+            value: Scalar prediction of expected future reward
+        """
+        return self.layers(state_embedding)
 
 class RewardModel(nn.Module):
     """Simple reward model that maps embeddings to scalar rewards"""
@@ -259,8 +429,8 @@ if __name__ == "__main__":
     # Stage 2: Reward model training
     trainer.stage2_reward_model_training(preference_data, epochs=2)
     
-    # Stage 3: PPO training
-    trainer.stage3_ppo_training(prompts, epochs=2)
+    # Stage 3: PPO training with value function
+    trainer.stage3_ppo_with_value_function(prompts, epochs=2)
     
     print("\nRLHF training completed!")
     
